@@ -34,7 +34,7 @@ class StreamingJSONReporting(object):
         self._write_json(msg)
         self.handle.close()
 
-    def on_open(self, filename, config, label, **kwargs):
+    def on_open(self, filename, task_type, config, label, **kwargs):
         self.label = str(label)
         self.handle = open(filename, "a", 1)
 
@@ -44,6 +44,7 @@ class StreamingJSONReporting(object):
         config_sha1 = hashlib.sha1(json.dumps(config).encode('utf-8')).hexdigest()
         msg = {
             'event_type': 'CREATED',
+            'task_type': task_type,
             'config': config,
             'label': self.label,
             'username': username,
