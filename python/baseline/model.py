@@ -133,7 +133,7 @@ create_seq2seq_model = exporter(
     )
 )
 
-@exporter
+
 def create_lang_model(known_creators, embeddings, **kwargs):
     model_type = kwargs.get('model_type', 'default')
     if model_type in known_creators:

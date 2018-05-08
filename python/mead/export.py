@@ -2,7 +2,6 @@ import argparse
 import mead
 from mead.utils import convert_path
 
-
 def main():
     parser = argparse.ArgumentParser(description='Train a text classifier')
     parser.add_argument('--config', help='JSON Configuration for an experiment', required=True, type=convert_path)

@@ -8,6 +8,72 @@ import os
 from mead.downloader import EmbeddingDownloader, DataDownloader, read_json
 from mead.mime_type import mime_type
 from baseline.utils import export
+import datetime
+import hashlib
+import socket
+import getpass
+import portalocker
+
+
+def _time_now():
+    return datetime.datetime.utcnow().isoformat()
+
+
+class StreamingJSONReporting(object):
+
+    def __init__(self):
+        super(StreamingJSONReporting, self).__init__()
+
+    def _write_json(self, msg):
+        portalocker.lock(self.handle, portalocker.LOCK_EX)
+        self.handle.write(json.dumps(msg) + '\n')
+        portalocker.unlock(self.handle)
+
+    def on_close(self, status="COMPLETED"):
+        msg = {'event_type': 'CLOSED', 'label': self.label, 'date': _time_now(), 'status': status}
+        self._write_json(msg)
+        self.handle.close()
+
+    def on_open(self, filename, config, label, **kwargs):
+        self.label = str(label)
+        self.handle = open(filename, "a", 1)
+
+        hostname = kwargs.get('hostname', socket.gethostname())
+        username = kwargs.get('username', getpass.getuser())
+
+        config_sha1 = hashlib.sha1(json.dumps(config).encode('utf-8')).hexdigest()
+        msg = {
+            'event_type': 'CREATED',
+            'config': config,
+            'label': self.label,
+            'username': username,
+            'hostname': hostname,
+            'date': _time_now(),
+            'label': label,
+            'config_sha1': config_sha1
+        }
+        self._write_json(msg)
+
+    def on_tick(self, metrics, tick, phase, tick_type=None):
+        """Write a streaming JSON line to the handle file
+
+        :param metrics: A map of metrics to scores
+        :param tick: The time (resolution defined by `tick_type`)
+        :param phase: The phase of training (`Train`, `Valid`, `Test`)
+        :param tick_type: The resolution of tick (`STEP`, `EPOCH`)
+        :return:
+        """
+
+        if tick_type is None:
+            tick_type = 'STEP'
+            if phase in ['Valid', 'Test']:
+                tick_type = 'EPOCH'
+
+        msg = {'event_type': 'TICK', 'label': self.label, 'date': _time_now(), 'tick_type': tick_type, 'tick': tick, 'phase': phase }
+        for k, v in metrics.items():
+            msg[k] = v
+
+        self._write_json(msg)
 
 __all__ = []
 exporter = export(__all__)
@@ -21,12 +87,16 @@ class Task(object):
         self.config_params = None
         self.ExporterType = None
         self.mead_config = mead_config
+        self.job_info = StreamingJSONReporting()
         if mead_config is not None:
             self.data_download_cache = os.path.expanduser(read_json(mead_config).get("datacache", "~/.bl-data/"))
         else:
             self.data_download_cache = os.path.expanduser("~/.bl-data/")
         print("using {} as data/embeddings cache".format(self.data_download_cache))
         self._configure_logger(logger_file)
+
+    def get_task_type(self):
+        pass
 
     def _configure_logger(self, logger_file):
         """Use the logger file (logging.json) to configure the log, but overwrite the filename to include the PID
@@ -63,6 +133,8 @@ class Task(object):
         """
         datasets_set = mead.utils.index_by_label(datasets_index)
         self.config_params = self._read_config(config_file)
+        jobs_file = self.config_params.get('jobs', 'jobs.log')
+        self.job_info.on_open(jobs_file, self.get_task_type(), self.config_params, os.getpid())
         self._setup_task()
         self._configure_reporting()
         self.dataset = datasets_set[self.config_params['dataset']]
@@ -105,6 +177,7 @@ class Task(object):
         self._load_dataset()
         model = self._create_model()
         self.task.fit(model, self.train_data, self.valid_data, self.test_data, **self.config_params['train'])
+        self.job_info.on_close()
         return model
 
     def _configure_reporting(self):
@@ -113,7 +186,9 @@ class Task(object):
             "visdom": self.config_params.get('visdom', False),
             "tensorboard": self.config_params.get('tensorboard', False)
         }
+
         reporting = baseline.setup_reporting(**reporting)
+        reporting.append(self.job_info.on_tick)
         self.config_params['train']['reporting'] = reporting
         logging.basicConfig(level=logging.DEBUG)
 
@@ -191,9 +266,14 @@ class Task(object):
 @exporter
 class ClassifierTask(Task):
 
+    TASK_TYPE = "classify"
+
     def __init__(self, logging_file, mead_config, **kwargs):
         super(ClassifierTask, self).__init__(logging_file, mead_config, **kwargs)
         self.task = None
+
+    def get_task_type(self):
+        return ClassifierTask.TASK_TYPE
 
     def _create_task_specific_reader(self):
         return baseline.create_pred_reader(self.config_params['preproc']['mxlen'],
@@ -246,7 +326,6 @@ class ClassifierTask(Task):
         vocab, self.labels = self.reader.build_vocab([self.dataset['train_file'], self.dataset['valid_file'], self.dataset['test_file']])
         self.embeddings, self.feat2index = self._create_embeddings(embeddings_set, {'word': vocab})
 
-
     def _create_model(self):
         return self.task.create_model(self.embeddings, self.labels, **self.config_params['model'])
 
@@ -255,15 +334,20 @@ class ClassifierTask(Task):
         self.valid_data = self.reader.load(self.dataset['valid_file'], self.feat2index, self.config_params['batchsz'])
         self.test_data = self.reader.load(self.dataset['test_file'], self.feat2index, self.config_params.get('test_batchsz', 1))
 
-Task.TASK_REGISTRY['classify'] = ClassifierTask
+Task.TASK_REGISTRY[ClassifierTask.TASK_TYPE] = ClassifierTask
 
 
 @exporter
 class TaggerTask(Task):
 
+    TASK_TYPE = "tagger"
+
     def __init__(self, logging_file, mead_config, **kwargs):
         super(TaggerTask, self).__init__(logging_file, mead_config, **kwargs)
         self.task = None
+
+    def get_task_type(self):
+        return TaggerTask.TASK_TYPE
 
     def _create_task_specific_reader(self):
         preproc = self.config_params['preproc']
@@ -331,15 +415,20 @@ class TaggerTask(Task):
         self.task.fit(model, self.train_data, self.valid_data, self.test_data, conll_output=conll_output, txts=self.txts, **self.config_params['train'])
         return model
 
-Task.TASK_REGISTRY['tagger'] = TaggerTask
+Task.TASK_REGISTRY[TaggerTask.TASK_TYPE] = TaggerTask
 
 
 @exporter
 class EncoderDecoderTask(Task):
 
+    TASK_TYPE = "seq2seq"
+
     def __init__(self, logging_file, mead_config, **kwargs):
         super(EncoderDecoderTask, self).__init__(logging_file, mead_config, **kwargs)
         self.task = None
+
+    def get_task_type(self):
+        return EncoderDecoderTask.TASK_TYPE
 
     def _create_task_specific_reader(self):
         preproc = self.config_params['preproc']
@@ -417,15 +506,20 @@ class EncoderDecoderTask(Task):
                                                                                      num_ex, reverse=False)
         super(EncoderDecoderTask, self).train()
 
-Task.TASK_REGISTRY['seq2seq'] = EncoderDecoderTask
+Task.TASK_REGISTRY[EncoderDecoderTask.TASK_TYPE] = EncoderDecoderTask
 
 
 @exporter
 class LanguageModelingTask(Task):
 
+    TASK_TYPE = "lm"
+
     def __init__(self, logging_file, mead_config, **kwargs):
         super(LanguageModelingTask, self).__init__(logging_file, mead_config, **kwargs)
         self.task = None
+
+    def get_task_type(self):
+        return LanguageModelingTask.TASK_TYPE
 
     def _create_task_specific_reader(self):
         mxwlen = self.config_params['preproc']['mxwlen']
@@ -507,4 +601,5 @@ class LanguageModelingTask(Task):
 
         super(LanguageModelingTask, self).train()
 
-Task.TASK_REGISTRY['lm'] = LanguageModelingTask
+Task.TASK_REGISTRY[LanguageModelingTask.TASK_TYPE] = LanguageModelingTask
+
