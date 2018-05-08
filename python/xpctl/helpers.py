@@ -14,3 +14,4 @@ def log2json(log):
 def read_config(config):
     with open(config) as f:
         return json.load(f)
+
