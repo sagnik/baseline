@@ -5,7 +5,7 @@ import pandas as pd
 import getpass
 from click_shell import shell
 import click
-from xpctl.core import ExperimentRepo
+from xpctl.core import ExperimentRepo, EVENT_TYPES
 from xpctl.helpers import *
 pd.set_option('display.expand_frame_repr', False)
 
@@ -31,13 +31,6 @@ class RepoManager(object):
         click.echo("db connection unsuccessful, aborting")
         sys.exit(1)
 
-
-EVENT_TYPES = {
-    "train": "train_events", "Train": "train_events",
-    "test": "test_events", "Test": "test_events",
-    "valid": "valid_events", "Valid": "valid_events",
-    "dev": "valid_events", "Dev": "valid_events"
-}
 
 
 # set up env

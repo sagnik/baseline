@@ -4,80 +4,15 @@ import numpy as np
 import logging
 import logging.config
 import mead.utils
+import mead.events
 import os
 from mead.downloader import EmbeddingDownloader, DataDownloader, read_json
 from mead.mime_type import mime_type
 from baseline.utils import export
-import datetime
-import hashlib
-import socket
-import getpass
-import portalocker
-
-
-def _time_now():
-    return datetime.datetime.utcnow().isoformat()
-
-
-class StreamingJSONReporting(object):
-
-    def __init__(self):
-        super(StreamingJSONReporting, self).__init__()
-
-    def _write_json(self, msg):
-        portalocker.lock(self.handle, portalocker.LOCK_EX)
-        self.handle.write(json.dumps(msg) + '\n')
-        portalocker.unlock(self.handle)
-
-    def on_close(self, status="COMPLETED"):
-        msg = {'event_type': 'CLOSED', 'label': self.label, 'date': _time_now(), 'status': status}
-        self._write_json(msg)
-        self.handle.close()
-
-    def on_open(self, filename, task_type, config, label, **kwargs):
-        self.label = str(label)
-        self.handle = open(filename, "a", 1)
-
-        hostname = kwargs.get('hostname', socket.gethostname())
-        username = kwargs.get('username', getpass.getuser())
-
-        config_sha1 = hashlib.sha1(json.dumps(config).encode('utf-8')).hexdigest()
-        msg = {
-            'event_type': 'CREATED',
-            'task_type': task_type,
-            'config': config,
-            'label': self.label,
-            'username': username,
-            'hostname': hostname,
-            'date': _time_now(),
-            'label': label,
-            'config_sha1': config_sha1
-        }
-        self._write_json(msg)
-
-    def on_tick(self, metrics, tick, phase, tick_type=None):
-        """Write a streaming JSON line to the handle file
-
-        :param metrics: A map of metrics to scores
-        :param tick: The time (resolution defined by `tick_type`)
-        :param phase: The phase of training (`Train`, `Valid`, `Test`)
-        :param tick_type: The resolution of tick (`STEP`, `EPOCH`)
-        :return:
-        """
-
-        if tick_type is None:
-            tick_type = 'STEP'
-            if phase in ['Valid', 'Test']:
-                tick_type = 'EPOCH'
-
-        msg = {'event_type': 'TICK', 'label': self.label, 'date': _time_now(), 'tick_type': tick_type, 'tick': tick, 'phase': phase }
-        for k, v in metrics.items():
-            msg[k] = v
-
-        self._write_json(msg)
 
 __all__ = []
 exporter = export(__all__)
+
 
 @exporter
 class Task(object):
@@ -88,11 +23,22 @@ class Task(object):
         self.config_params = None
         self.ExporterType = None
         self.mead_config = mead_config
-        self.job_info = StreamingJSONReporting()
-        if mead_config is not None:
-            self.data_download_cache = os.path.expanduser(read_json(mead_config).get("datacache", "~/.bl-data/"))
-        else:
+        if mead_config is None:
             self.data_download_cache = os.path.expanduser("~/.bl-data/")
+            self.events = mead.events.StreamingJSONReporting('event.log')
+        else:
+            settings = read_json(mead_config)
+            self.data_download_cache = os.path.expanduser(settings.get("datacache", "~/.bl-data/"))
+            event_reporting = settings.get('events', 'default')
+            if event_reporting == 'default':
+                self.events = mead.events.StreamingJSONReporting(settings.get('events_file', 'event.log'))
+            elif event_reporting.startswith('mongo'):
+                username = settings.get('username')
+                password = settings.get('password')
+                host = settings.get('host', 'localhost')
+                port = settings.get('port', 27017)
+                self.events = mead.events.MongoEventReporting(host, port, username, password)
+
         print("using {} as data/embeddings cache".format(self.data_download_cache))
         self._configure_logger(logger_file)
 
@@ -134,8 +80,7 @@ class Task(object):
         """
         datasets_set = mead.utils.index_by_label(datasets_index)
         self.config_params = self._read_config(config_file)
-        jobs_file = self.config_params.get('jobs', 'jobs.log')
-        self.job_info.on_open(jobs_file, self.get_task_type(), self.config_params, os.getpid())
+        self.job_id = self.events.create_experiment(self.get_task_type(), self.config_params)
         self._setup_task()
         self._configure_reporting()
         self.dataset = datasets_set[self.config_params['dataset']]
@@ -178,7 +123,7 @@ class Task(object):
         self._load_dataset()
         model = self._create_model()
         self.task.fit(model, self.train_data, self.valid_data, self.test_data, **self.config_params['train'])
-        self.job_info.on_close()
+        self.events.close_experiment(self.job_id, self.get_task_type(), status_event="COMPLETED")
         return model
 
     def _configure_reporting(self):
@@ -189,7 +134,10 @@ class Task(object):
         }
 
         reporting = baseline.setup_reporting(**reporting)
-        reporting.append(self.job_info.on_tick)
+
+        reporting.append(lambda metrics, tick, phase, tick_type=None:
+                         self.events.update_experiment(self.job_id, self.get_task_type(),
+                                                       metrics, tick, phase, tick_type))
         self.config_params['train']['reporting'] = reporting
         logging.basicConfig(level=logging.DEBUG)
 
@@ -410,10 +358,13 @@ class TaggerTask(Task):
         self.test_data, self.txts = self.reader.load(self.dataset['test_file'], self.feat2index, self.config_params.get('test_batchsz', 1), shuffle=False, do_sort=False)
 
     def train(self):
+        conll_output = self.config_params.get("conll_output", None)
         self._load_dataset()
         model = self._create_model()
-        conll_output = self.config_params.get("conll_output", None)
-        self.task.fit(model, self.train_data, self.valid_data, self.test_data, conll_output=conll_output, txts=self.txts, **self.config_params['train'])
+
+        self.task.fit(model, self.train_data, self.valid_data, self.test_data,
+                      conll_output=conll_output, txts=self.txts, **self.config_params['train'])
+        self.events.close_experiment(self.job_id, self.get_task_type(), status_event="COMPLETED")
         return model
 
 Task.TASK_REGISTRY[TaggerTask.TASK_TYPE] = TaggerTask

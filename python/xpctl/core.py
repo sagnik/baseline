@@ -16,6 +16,13 @@ __all__ = []
 exporter = export(__all__)
 
 
+EVENT_TYPES = {
+    "train": "train_events", "Train": "train_events",
+    "test": "test_events", "Test": "test_events",
+    "valid": "valid_events", "Valid": "valid_events",
+    "dev": "valid_events", "Dev": "valid_events"
+}
+
 @exporter
 def store_model(checkpoint_base, config_sha1, checkpoint_store, print_fn=print):
     mdir, mbase = os.path.split(checkpoint_base)
@@ -188,8 +195,6 @@ class ExperimentRepo(object):
         :param events_obj: (``dict``) A dictionary containing the events that transpired during training
         :param kwargs: See below
 
-        label = kwargs.get("label", id)
-
         :Keyword Arguments:
         * *checkpoint_base* (``str``) -- If we are putting the model simultaneously, required basename for model
         * *checkpoint_store* (``str``) -- If we are putting the model simultaneously, required destination
@@ -229,6 +234,58 @@ class MongoRepo(ExperimentRepo):
         if "reporting_db" not in dbnames:
             raise Exception("no database for results found")
         self.db = client.reporting_db
+
+    def create_experiment(self, task, config_obj, **kwargs):
+        now = datetime.datetime.utcnow().isoformat()
+        print_fn = kwargs.get('print_fn', print)
+        hostname = kwargs.get('hostname', socket.gethostname())
+        username = kwargs.get('username', getpass.getuser())
+        config_sha1 = hashlib.sha1(json.dumps(config_obj).encode('utf-8')).hexdigest()
+        label = kwargs.get("label", config_sha1)
+        post = {
+            "config": config_obj,
+            "train_events": [],
+            "valid_events": [],
+            "test_events": [],
+            "username": username,
+            "hostname": hostname,
+            "date": now,
+            "label": label,
+            "sha1": config_sha1,
+            "version": __version__,
+            "status": "CREATED",
+            "last_updated": now
+        }
+        if task in self.db.collection_names():
+            print_fn("updating results for existing task [{}] in host [{}]".format(task, self.dbhost))
+        else:
+            print_fn("creating new task [{}] in host [{}]".format(task, self.dbhost))
+        coll = self.db[task]
+        result = coll.insert_one(post)
+
+        print_fn("results updated, the new results are stored with the record id: {}".format(result.inserted_id))
+        return result.inserted_id
+
+    def update_experiment(self, id, task, metrics, tick, phase, tick_type=None):
+        coll = self.db[task]
+        now = datetime.datetime.utcnow().isoformat()
+        entry = {
+            "tick": tick,
+            "phase": phase,
+            "tick_type": tick_type
+        }
+        for k, v in metrics.items:
+            entry[k] = v
+
+        array_to_append = EVENT_TYPES[phase]
+        update = {"$pushAll": {array_to_append: [entry], "last_updated": now}}
+        coll.update_one({"id": id}, update)
+        pass
+
+    def close_experiment(self, id, task, status_event):
+        coll = self.db[task]
+        now = datetime.datetime.utcnow().isoformat()
+        coll.update_on({"id": id}, {"$set": {"status": "COMPLETED", "last_updated": now}})
 
     def put_result(self, task, config_obj, events_obj, **kwargs):
         now = datetime.datetime.utcnow().isoformat()
