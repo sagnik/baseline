@@ -23,6 +23,7 @@ EVENT_TYPES = {
     "dev": "valid_events", "Dev": "valid_events"
 }
 
+
 @exporter
 def store_model(checkpoint_base, config_sha1, checkpoint_store, print_fn=print):
     mdir, mbase = os.path.split(checkpoint_base)
@@ -57,6 +58,32 @@ def store_model(checkpoint_base, config_sha1, checkpoint_store, print_fn=print):
     return model_loc + ".zip"
 
 
+class ExperimentRecord(object):
+
+    def __init__(self, **kwargs):
+        self.id = kwargs.get('id', None)
+        self.label = kwargs.get('label', self.id)
+        self.task = kwargs.get('task', None)
+        self.config = kwargs.get('config', None)
+        self.sha1 = kwargs.get('sha1',
+                               None if self.config is None else hashlib.sha1(json.dumps(self.config).encode('utf-8')).hexdigest())
+        self.label = kwargs.get("label", self.sha1)
+        self.date = kwargs.get('date', None)
+        self.last_update = kwargs.get('last_update', None)
+        self.status = kwargs.get('status', None)
+        self.hostname = kwargs.get('hostname', socket.gethostname())
+        self.username = kwargs.get('username', getpass.getuser())
+        self.version = kwargs.get('version', __version__)
+        self.train_events = kwargs.get('train_events', None)
+        self.valid_events = kwargs.get('valid_events', None)
+        self.test_events = kwargs.get('test_events', None)
+        self.events = {
+            'test_events': self.test_events,
+            'train_events': self.train_events,
+            'valid_events': self.valid_events
+        }
+
+
 @exporter
 class ExperimentRepo(object):
 
@@ -75,6 +102,25 @@ class ExperimentRepo(object):
 
         :param task: (``str``) Task name
         :return: (``bool``) `True` if it exist, `False` if it does not
+        """
+        pass
+
+    def get_record(self, task, id):
+        """Return the full record associated with this `id`
+
+        :param task: (``str``) Task name
+        :param id: The identifier
+        :return: An ExperimentRecord
+        """
+        pass
+
+    def push_record(self, task, record, print_fn=print):
+        """Push a record to the ExperimentRepo
+
+        :param task: (``str``) Task name
+        :param record: Push this record up to the repo
+        :param print_fn: A callback for printing
+        :return: An id associated with this record
         """
         pass
 
@@ -123,7 +169,7 @@ class ExperimentRepo(object):
         pass
 
     def get_results(self, username, metric, sort, dataset, task, event_type):
-        """Get results from the database
+        """Get results from the database (deprecated)
 
         :param username: (``str``) The username
         :param metric: (``str``) The metric to use
@@ -163,7 +209,7 @@ class ExperimentRepo(object):
         :param new_label: (``str``) The new label
         :return: (``tuple``) A tuple of the old name and then the new name
         """
-        raise NotImplemented("Base ExperimentRepo events are immutable")
+        pass
 
     def rm(self, id, task, print_fn=print):
         """Remove a record specified by this id
@@ -173,7 +219,7 @@ class ExperimentRepo(object):
         :param print_fn: A print callback which takes a ``str`` argument
         :return: (``bool``) True if something was removed
         """
-        raise NotImplemented("Base ExperimentRepo tasks are immutable")
+        pass
 
     def put_model(self, id, task, checkpoint_base, checkpoint_store, print_fn=print):
         """Put the model for the record identified by id to the the checkpoint store
@@ -209,6 +255,170 @@ class ExperimentRepo(object):
 
 
 @exporter
+class FileExperimentRepo(object):
+
+    def __init__(self, filename):
+        import portalocker
+        super(FileExperimentRepo, self).__init__()
+        self.tasks = {}
+        self.records = {}
+        self.configs = {}
+
+        self.metrics = {}
+        with open(filename) as f:
+            portalocker.lock(f, portalocker.LOCK_SH)
+            for line in f:
+                event = json.loads(line)
+                id = event['id']
+                if event['event_type'] == 'CREATED':
+                    task = event['task_type']
+                    record = self._create2record(event)
+                    self.records[record.id] = record
+                    task_records = self.tasks.get(task, []) + [record.id]
+                    self.tasks[task] = task_records
+                    self.configs[record.sha1] = record.config
+                elif event['event_type'] == 'TICK':
+                    self._add_tick(event)
+                elif event['event_type'] == 'CLOSED':
+                    self.records[id].status = event['status']
+                    self.records[id].last_updated = event['date']
+            portalocker.unlock(f)
+
+    def _create2record(self, obj):
+        return ExperimentRecord(id=obj['id'], status=obj['event_type'], config=obj['config'], task=obj['task_type'],
+                                hostname=obj['hostname'], username=obj['username'], sha1=obj['config_sha1'],
+                                label=obj['label'], date=obj['date'],
+                                train_events=[], valid_events=[], test_events=[])
+
+    def get_task_names(self):
+        """Get the names of all tasks in the repository
+
+        :return: A list of tasks
+        """
+        return self.tasks.keys()
+
+    def has_task(self, task):
+        return task in self.tasks.keys()
+
+    def get_record(self, _, id):
+        return self.records[id]
+
+    def push_record(self, task, record, print_fn=print):
+        """Push a record to the ExperimentRepo
+
+        :param task: (``str``) Task name
+        :param record: Push this record up to the repo
+        :param print_fn: A callback for printing
+        :return: An id associated with this record
+        """
+        raise NotImplemented('File-backed store is immutable')
+
+    def _add_tick(self, event):
+        id = event['id']
+        record = self.records[id]
+        dataset = record.config['dataset']
+        phase = event['phase']
+        tick = event['tick']
+        last_modified = event['date']
+        task = record.task
+        username = record.username
+        for key in event.keys():
+            if key not in ['event_type', 'id', 'date', 'phase']:
+                metric_id = self._key_for(key, dataset, task, phase.lower())
+                metrics = self.metrics.get(metric_id, []) + [(id, tick, username, event[key])]
+                self.metrics[metric_id] = metrics
+
+        del event['event_type']
+        del event['date']
+        if phase == 'Train':
+            self.records[id].train_events.append(event)
+        elif phase == 'Valid':
+            self.records[id].valid_events.append(event)
+        else:
+            self.records[id].test_events.append(event)
+        self.records[id].last_modified = last_modified
+
+    def _key_for(self, metric, dataset, task, event_type):
+        return '@@'.join([metric, dataset,task, event_type])
+
+    # (task, metric, dataset, phase)
+    def nbest_by_metric(self, username, metric, dataset, task, num_results, event_type, ascending):
+        """Get the n-best results according to the specific metrics
+
+        :param username: (``str``) Name of user or None
+        :param metric: (``str``) The name of the metric to use for N-best
+        :param dataset: (``str``) The name of the dataset
+        :param task: (``str``) The name of the task
+        :param num_results: (``int``) The number of results (max) to retrieve from the repo
+        :param event_type: (``str``) The event types to retrieve from repo
+        :param ascending: (``bool``) Should we sort ascending or descending (depends on metric)
+        :return: The N-best data frame
+        """
+        results = self.metrics.get(self._key_for(metric, dataset, task, event_type), [])
+        if username is not None:
+            results = [result for result in results if result[2] == username]
+
+        results = sorted(results, key=lambda result: result[-1], reverse=not ascending)[:num_results]
+        all_results = []
+        for result in results:
+            record = self.records[result[0]]
+            dataset = record.config['dataset']
+            all_results.append([record.id, record.username, record.label, dataset, record.sha1, record.date, result[-1]])
+
+        return pd.DataFrame(all_results, columns=['id', 'username', 'label', 'dataset', 'sha1', 'date', metric])
+    
+    def config2dict(self, _, sha1):
+        return self.configs[sha1]
+
+    def get_model_location(self, id, task):
+        raise NotImplemented('File-backed store doesnt currently return model locations')
+
+    def get_results(self, username, metrics, sort, dataset, task, event_type):
+        raise NotImplemented('Use nbest')
+
+    def get_info(self, task, event_types):
+        raise NotImplemented('File-backed store doesnt currently implement get_info')
+
+    def leaderboard_summary(self, task=None, event_types=None, print_fn=print):
+        raise NotImplemented('File-backed store doesnt currently implement the leaderboard')
+
+    def get_label(self, id, task):
+        """Get the label for the record with this id
+
+        :param id: The identifier for this record
+        :param task: (``str``) The task name
+        :return: (``str``) Return the user-defined label for this task
+        """
+        return self.records[id].label
+
+    def rename_label(self, id, task, new_label):
+        """Rename the user-defined label for the task identified by this id
+
+        :param id: The identifier for this record
+        :param task: (``str``) The task name
+        :param new_label: (``str``) The new label
+        :return: (``tuple``) A tuple of the old name and then the new name
+        """
+        raise NotImplemented("File-backed repositories are immutable")
+
+    def rm(self, id, task, print_fn=print):
+        """Remove a record specified by this id
+
+        :param id: The identifier for this record
+        :param task: (``str``) The task name for this record
+        :param print_fn: A print callback which takes a ``str`` argument
+        :return: (``bool``) True if something was removed
+        """
+        raise NotImplemented("File-backed repositories are immutable")
+
+    def put_model(self, id, task, checkpoint_base, checkpoint_store, print_fn=print):
+        raise NotImplemented("Cannot put to a file-backed repository!")
+
+    def put_result(self, task, config_obj, events_obj, **kwargs):
+        raise NotImplemented("Cannot put to a file-backed repository!")
+
+
+@exporter
 class MongoRepo(ExperimentRepo):
 
     def __init__(self, host, port, user, passw):
@@ -234,6 +444,57 @@ class MongoRepo(ExperimentRepo):
         if "reporting_db" not in dbnames:
             raise Exception("no database for results found")
         self.db = client.reporting_db
+
+    def get_record(self, task, id):
+        """Return the full record associated with this `id`
+
+        :param task: (``str``) Task name
+        :param id: The identifier
+        :return: An ExperimentRecord
+        """
+        mongo_record = self.db[task].find_one({"id": ObjectId(id)})
+        record = ExperimentRecord(id=mongo_record.id,
+                                  config=mongo_record.config,
+                                  username=mongo_record.username,
+                                  hostname=mongo_record.hostname,
+                                  date=mongo_record.date,
+                                  label=mongo_record.label,
+                                  sha1=mongo_record.sha1,
+                                  status=mongo_record.status,
+                                  version=mongo_record.version,
+                                  last_update=mongo_record.last_update,
+                                  test_events=mongo_record.test_events,
+                                  valid_events=mongo_record.valid_events,
+                                  train_events=mongo_record.train_events)
+        return record
+
+    def push_record(self, task, record, print_fn=print):
+        """Push a record to the ExperimentRepo
+
+        :param record: Push this record up to the repo
+        :return: An id associated with this record
+        """
+        post = {
+            "config": record.config,
+            "train_events": record.train_events,
+            "valid_events": record.valid_events,
+            "test_events": record.test_events,
+            "username": record.username,
+            "hostname": record.hostname,
+            "date": record.date,
+            "label": record.label,
+            "sha1": record.sha1,
+            "version": record.version
+        }
+        if task in self.db.collection_names():
+            print_fn("updating results for existing task [{}] in host [{}]".format(task, self.dbhost))
+        else:
+            print_fn("creating new task [{}] in host [{}]".format(task, self.dbhost))
+        coll = self.db[task]
+        result = coll.insert_one(post)
+
+        print_fn("results updated, the new results are stored with the record id: {}".format(result.inserted_id))
+        return result.inserted_id
 
     def create_experiment(self, task, config_obj, **kwargs):
         now = datetime.datetime.utcnow().isoformat()

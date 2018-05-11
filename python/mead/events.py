@@ -32,6 +32,7 @@ EVENT_TYPES = {
     "dev": "valid_events", "Dev": "valid_events"
 }
 
+
 @exporter
 class EventReporting(object):
 
@@ -117,7 +118,8 @@ class StreamingJSONReporting(EventReporting):
             if phase in ['Valid', 'Test']:
                 tick_type = 'EPOCH'
 
-        msg = {'event_type': 'TICK', 'id': id, 'date': _time_now(), 'tick_type': tick_type, 'tick': tick, 'phase': phase }
+        msg = {'event_type': 'TICK', 'id': id, 'date': _time_now(),
+               'tick_type': tick_type, 'tick': tick, 'phase': phase }
         for k, v in metrics.items():
             msg[k] = v
 
