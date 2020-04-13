@@ -1,4 +1,5 @@
 import csv
+import logging
 from itertools import chain
 import numpy as np
 from eight_mile.utils import exporter
@@ -7,7 +8,7 @@ from collections import OrderedDict
 
 __all__ = []
 export = exporter(__all__)
-
+LOGGER = logging.getLogger('baseline')
 
 @export
 class ConfusionMatrix:
@@ -17,20 +18,51 @@ class ConfusionMatrix:
     Metrics are available that use the confusion matrix
     """
 
-    def __init__(self, labels):
+    def __init__(self, labels=None, csv_file=None):
         """Constructor with input labels
 
         :param labels: Either a dictionary (`k=int,v=str`) or an array of labels
         """
-        if isinstance(labels, dict):
-            self.labels = []
-            for i in range(len(labels)):
-                self.labels.append(labels[i])
+        if labels is not None:
+            if isinstance(labels, dict):
+                self.labels = []
+                for i in range(len(labels)):
+                    self.labels.append(labels[i])
+            else:
+                self.labels = labels
+            nc = len(self.labels)
+            self._cm = np.zeros((nc, nc), dtype=np.int)
+        elif csv_file is not None:
+            self.from_csv(csv_file)
         else:
-            self.labels = labels
-        nc = len(self.labels)
-        self._cm = np.zeros((nc, nc), dtype=np.int)
-
+            LOGGER.error('must provide labels or a csv file')
+            
+    def from_csv(self, csv_file):
+        """
+        populate confusion matrix from a csv file
+        :param csv_file:
+        :return:
+        """
+        import csv
+        with open(csv_file) as rf:
+            preview = rf.read(9999)
+            has_header = csv.Sniffer().has_header(preview)
+            if not has_header:
+                LOGGER.error('confusion matrix csv file must have headers')
+            dialect = csv.Sniffer().sniff(preview)
+            rf.seek(0)
+            reader = csv.reader(rf, delimiter=dialect.delimiter, quotechar=dialect.quotechar)
+            for row_index, row in enumerate(reader):
+                if row_index == 0:
+                    header_row = row
+                    assert(len(set(header_row)) == len(header_row))
+                    self.labels = list(set(header_row) - {'labels'})
+                    nc = len(self.labels)
+                    self._cm = np.zeros((nc, nc), dtype=np.int)
+                else:
+                    for col_index in range(1, len(row)):
+                        self._cm[row_index-1, col_index-1] = row[col_index]
+            
     def add(self, truth, guess):
         """Add a single value to the confusion matrix based off `truth` and `guess`
 
